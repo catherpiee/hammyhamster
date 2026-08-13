@@ -1,0 +1,3 @@
+mediapipe==1.0.0
+opencv-contrib-python==5.0.0.93
+numpy==2.5.1

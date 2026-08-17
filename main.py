@@ -34,18 +34,42 @@ MEMES = {
     "cross_arms": "cross arms .jpg",
     "finger_mouth": "one finger mouth .jpg",
     "nerd": "nerd.jpg",
+    "shy": "cinamoroll ham.jpg",
+    "thinking": "think .jpg",
+    "hug": "plushie.jpg",
+    "sad": "look down side .jpg",
 }
 
 WINDOW_W, WINDOW_H = 640, 640
+WINDOW_NAME = "Hammyhamster"
+
+# Chrome around the meme/camera panels.
+HEADER_H = 46
+FOOTER_H = 28
+HEADER_BG = (26, 22, 22)
+FOOTER_BG = (18, 16, 16)
+DIVIDER_COLOR = (55, 50, 50)
+LIVE_DOT_COLOR = (90, 220, 100)
+GESTURE_PILL_BG = (200, 160, 255)
+GESTURE_PILL_FG = (25, 20, 20)
+HINT_COLOR = (150, 150, 150)
+DEBUG_BACKDROP_H = 165   # how tall a dark backdrop to draw behind the debug readout
 
 # Tuning knobs for the "glitchy" behavior.
 YAW_THRESHOLD_DEG = 18       # head turn needed to trigger side_eye
+PITCH_THRESHOLD_DEG = 15     # head tilt down needed to trigger sad
 VOTE_WINDOW = 12             # frames of history considered
 VOTE_MAJORITY = 7            # votes needed within the window to switch memes
 GLASSES_NEAR_FACE_DIST = 0.28   # how close (normalized) a pinch must be to the face to count as "glasses"
 MOUTH_NEAR_DIST = 0.14          # how close (normalized) the index fingertip must be to the mouth
 ELBOW_BEND_MAX_DEG = 100        # elbow angle (shoulder-elbow-wrist) below this counts as "bent" for bicep
 POSE_VISIBILITY_MIN = 0.5       # minimum pose-landmark visibility to trust a joint
+HANDS_TOGETHER_DIST = 0.12      # max distance between two hand centers to count as "together" (thinking/hug)
+HANDS_APART_MIN_DIST = 0.15     # min distance between two hand centers to count as "apart" (shy)
+THINKING_NEAR_MOUTH_DIST = 0.25 # how close (normalized) clasped hands must be to the mouth for "thinking"
+SHY_NEAR_FACE_DIST = 0.30       # how close (normalized) each hand must be to the face for "shy"
+SHY_HEIGHT_TOLERANCE = 0.18     # how far above/below face height a hand can be for "shy"
+HUG_BELOW_FACE_DIST = 0.20      # how far below the face clasped hands must sit for "hug"
 
 # Face-mesh landmark id used as a stand-in for the mouth's position.
 MOUTH_LANDMARK = 13
@@ -236,6 +260,53 @@ def detect_cross_arms(pose_landmarks):
     return wrists_close and at_chest_height
 
 
+def two_hand_centers(hand_landmarks_list):
+    if len(hand_landmarks_list) != 2:
+        return None
+    return [landmarks_center(lm) for lm in hand_landmarks_list]
+
+
+def detect_shy(hand_landmarks_list, head_center):
+    # One hand on each cheek: apart from each other (not clasped together,
+    # which is "thinking"/"hug" instead), both close to the face, and both
+    # roughly level with it rather than up near the forehead or down at the
+    # chest.
+    centers = two_hand_centers(hand_landmarks_list)
+    if centers is None or head_center is None:
+        return False
+    if np.linalg.norm(centers[0] - centers[1]) <= HANDS_APART_MIN_DIST:
+        return False
+    return all(
+        np.linalg.norm(c - head_center) < SHY_NEAR_FACE_DIST
+        and abs(c[1] - head_center[1]) < SHY_HEIGHT_TOLERANCE
+        for c in centers
+    )
+
+
+def detect_thinking(hand_landmarks_list, mouth_point):
+    # Hands clasped together right at mouth/chin height, as in a "hands
+    # folded under the chin" thinking pose.
+    centers = two_hand_centers(hand_landmarks_list)
+    if centers is None or mouth_point is None:
+        return False
+    if np.linalg.norm(centers[0] - centers[1]) >= HANDS_TOGETHER_DIST:
+        return False
+    avg_center = (centers[0] + centers[1]) / 2
+    return np.linalg.norm(avg_center - mouth_point) < THINKING_NEAR_MOUTH_DIST
+
+
+def detect_hug(hand_landmarks_list, head_center):
+    # Hands clasped together, but down at chest height rather than up near
+    # the mouth (that's "thinking") - as if cradling something held close.
+    centers = two_hand_centers(hand_landmarks_list)
+    if centers is None or head_center is None:
+        return False
+    if np.linalg.norm(centers[0] - centers[1]) >= HANDS_TOGETHER_DIST:
+        return False
+    avg_center = (centers[0] + centers[1]) / 2
+    return avg_center[1] - head_center[1] > HUG_BELOW_FACE_DIST
+
+
 def landmarks_center(landmarks):
     x = sum(p.x for p in landmarks) / len(landmarks)
     y = sum(p.y for p in landmarks) / len(landmarks)
@@ -250,6 +321,15 @@ def head_yaw_degrees(transformation_matrix):
     return math.degrees(math.asin(max(-1.0, min(1.0, r02))))
 
 
+def head_pitch_degrees(transformation_matrix):
+    # Companion to head_yaw_degrees: R[1][2] tracks rotation about the
+    # horizontal axis (nodding up/down). Sign/threshold picked so a downward
+    # tilt reads positive - verify against the debug readout and flip the
+    # sign here if "sad" triggers on an upward tilt instead.
+    r12 = transformation_matrix[1][2]
+    return math.degrees(math.asin(max(-1.0, min(1.0, -r12))))
+
+
 def classify_gesture(hand_result, face_result, pose_result):
     hand_landmarks_list = hand_result.hand_landmarks
     pose_landmarks = pose_result.pose_landmarks[0] if pose_result.pose_landmarks else None
@@ -257,12 +337,14 @@ def classify_gesture(hand_result, face_result, pose_result):
     head_center = np.array([0.5, 0.3])
     mouth_point = None
     yaw_deg = None
+    pitch_deg = None
     if face_result.face_landmarks:
         face_landmarks = face_result.face_landmarks[0]
         head_center = landmarks_center(face_landmarks)
         mouth_point = np.array([face_landmarks[MOUTH_LANDMARK].x, face_landmarks[MOUTH_LANDMARK].y])
     if face_result.facial_transformation_matrixes:
         yaw_deg = head_yaw_degrees(face_result.facial_transformation_matrixes[0])
+        pitch_deg = head_pitch_degrees(face_result.facial_transformation_matrixes[0])
 
     # Per-hand shape/position checks run BEFORE the body-pose (cross_arms/
     # bicep) and "two hands visible" fallbacks below, not after. A normal
@@ -285,7 +367,7 @@ def classify_gesture(hand_result, face_result, pose_result):
         if is_pinch(landmarks):
             near_face = np.linalg.norm(hand_c - head_center) < GLASSES_NEAR_FACE_DIST
             if near_face:
-                return "glasses", yaw_deg
+                return "glasses", yaw_deg, pitch_deg
             continue
 
         fingers = fingers_up(landmarks)
@@ -307,9 +389,9 @@ def classify_gesture(hand_result, face_result, pose_result):
                 and 0.08 < abs(hand_c[0] - head_center[0]) < 0.30
             )
             if beside_head:
-                return "fist_by_head", yaw_deg
+                return "fist_by_head", yaw_deg, pitch_deg
             if gesture == "thumbs_up":
-                return ("thumbs_down" if thumb_points_down(landmarks) else "thumbs_up"), yaw_deg
+                return ("thumbs_down" if thumb_points_down(landmarks) else "thumbs_up"), yaw_deg, pitch_deg
             continue
 
         if gesture == "pointer":
@@ -322,25 +404,40 @@ def classify_gesture(hand_result, face_result, pose_result):
             fingertip = np.array([landmarks[8].x, landmarks[8].y])
             near_mouth = mouth_point is not None and np.linalg.norm(fingertip - mouth_point) < MOUTH_NEAR_DIST
             if near_mouth:
-                return "finger_mouth", yaw_deg
-            return "nerd", yaw_deg
+                return "finger_mouth", yaw_deg, pitch_deg
+            return "nerd", yaw_deg, pitch_deg
+
+    # Two-hand shape/position gestures (shy/thinking/hug) run next, still
+    # ahead of the pose-based and hand-count fallbacks below — same reason
+    # as the per-hand checks above: they read a specific hand shape+position
+    # combo that the coarser fallbacks would otherwise swallow.
+    if detect_shy(hand_landmarks_list, head_center if face_result.face_landmarks else None):
+        return "shy", yaw_deg, pitch_deg
+    if detect_thinking(hand_landmarks_list, mouth_point):
+        return "thinking", yaw_deg, pitch_deg
+    if detect_hug(hand_landmarks_list, head_center if face_result.face_landmarks else None):
+        return "hug", yaw_deg, pitch_deg
 
     # Pose-based crossed-arms/bicep checked before the "two hands visible"
     # catch-all below — crossed arms often still shows a sliver of both
     # hands to the hand model, which used to win the truck result before
     # the more specific pose-based crossed-arms check ever got a turn.
     if detect_cross_arms(pose_landmarks):
-        return "cross_arms", yaw_deg
+        return "cross_arms", yaw_deg, pitch_deg
     if detect_bicep(pose_landmarks):
-        return "bicep", yaw_deg
+        return "bicep", yaw_deg, pitch_deg
 
     if len(hand_landmarks_list) == 2:
-        return "two_hands", yaw_deg
+        return "two_hands", yaw_deg, pitch_deg
 
+    # Downward head tilt (sad) checked before sideways turn (side_eye) so a
+    # head that's both down and slightly turned reads as sad.
+    if pitch_deg is not None and pitch_deg > PITCH_THRESHOLD_DEG:
+        return "sad", yaw_deg, pitch_deg
     if yaw_deg is not None and abs(yaw_deg) > YAW_THRESHOLD_DEG:
-        return "side_eye", yaw_deg
+        return "side_eye", yaw_deg, pitch_deg
 
-    return "default", yaw_deg
+    return "default", yaw_deg, pitch_deg
 
 
 def draw_hand_landmarks(square_frame, hand_landmarks_list, orig_w, orig_h, crop_x0, crop_y0):
@@ -356,6 +453,64 @@ def draw_hand_landmarks(square_frame, hand_landmarks_list, orig_w, orig_h, crop_
             cv2.line(square_frame, points[a], points[b], (0, 255, 0), 2)
         for x, y in points:
             cv2.circle(square_frame, (x, y), 3, (0, 0, 255), -1)
+
+
+def display_gesture_name(gesture):
+    return gesture.replace("_", " ").title()
+
+
+def draw_debug_backdrop(square_frame):
+    # A translucent dark strip behind the fine-grained debug readout so the
+    # yellow text stays legible over bright/busy camera backgrounds instead
+    # of just being drawn straight onto the live video.
+    overlay = square_frame[:DEBUG_BACKDROP_H].copy()
+    cv2.rectangle(overlay, (0, 0), (square_frame.shape[1], DEBUG_BACKDROP_H), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.45, square_frame[:DEBUG_BACKDROP_H], 0.55, 0, square_frame[:DEBUG_BACKDROP_H])
+
+
+def compose_window(meme_view, cam_view, gesture, debug_on):
+    # Meme + camera side by side, with a thin divider, wrapped in a header
+    # (app name, live dot, current-gesture pill) and a footer (key hints) so
+    # the whole thing reads as one app window instead of a bare video feed.
+    content = np.hstack((meme_view, cam_view))
+    content[:, WINDOW_W - 1:WINDOW_W + 1] = DIVIDER_COLOR
+
+    canvas = np.empty((HEADER_H + content.shape[0] + FOOTER_H, content.shape[1], 3), dtype=np.uint8)
+    canvas[:HEADER_H] = HEADER_BG
+    canvas[HEADER_H:HEADER_H + content.shape[0]] = content
+    canvas[HEADER_H + content.shape[0]:] = FOOTER_BG
+
+    cv2.circle(canvas, (18, HEADER_H // 2), 5, LIVE_DOT_COLOR, -1, cv2.LINE_AA)
+    cv2.putText(
+        canvas, "Hammyhamster", (32, HEADER_H // 2 + 7),
+        cv2.FONT_HERSHEY_DUPLEX, 0.7, (235, 235, 235), 1, cv2.LINE_AA,
+    )
+
+    label = display_gesture_name(gesture)
+    (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.65, 1)
+    pad_x, pad_y = 14, 8
+    pill_w, pill_h = label_w + pad_x * 2, label_h + pad_y * 2
+    pill_x0 = canvas.shape[1] - pill_w - 16
+    pill_y0 = (HEADER_H - pill_h) // 2
+    cv2.rectangle(canvas, (pill_x0, pill_y0), (pill_x0 + pill_w, pill_y0 + pill_h), GESTURE_PILL_BG, -1, cv2.LINE_AA)
+    cv2.putText(
+        canvas, label, (pill_x0 + pad_x, pill_y0 + pill_h - pad_y - 2),
+        cv2.FONT_HERSHEY_DUPLEX, 0.65, GESTURE_PILL_FG, 1, cv2.LINE_AA,
+    )
+
+    footer_y = HEADER_H + content.shape[0] + FOOTER_H // 2 + 5
+    cv2.putText(
+        canvas, "q / esc: quit", (16, footer_y),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, HINT_COLOR, 1, cv2.LINE_AA,
+    )
+    debug_hint = "d: hide debug" if debug_on else "d: show debug"
+    (debug_w, _), _ = cv2.getTextSize(debug_hint, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv2.putText(
+        canvas, debug_hint, (canvas.shape[1] - debug_w - 16, footer_y),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, HINT_COLOR, 1, cv2.LINE_AA,
+    )
+
+    return canvas
 
 
 def main():
@@ -390,113 +545,151 @@ def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Could not open webcam.")
+        hand_landmarker.close()
+        face_landmarker.close()
+        pose_landmarker.close()
         return
 
     stable_gesture = "default"
     votes = deque(maxlen=VOTE_WINDOW)
     frame_index = 0
+    debug_on = True
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
-        frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        timestamp_ms = frame_index * 33
-        frame_index += 1
-        hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-        face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
-        pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        detected, yaw_deg = classify_gesture(hand_result, face_result, pose_result)
-        votes.append(detected)
+            timestamp_ms = frame_index * 33
+            frame_index += 1
+            hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+            face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
+            pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
 
-        counts = Counter(votes)
-        top_gesture, top_count = counts.most_common(1)[0]
-        if top_count >= VOTE_MAJORITY:
-            stable_gesture = top_gesture
+            detected, yaw_deg, pitch_deg = classify_gesture(hand_result, face_result, pose_result)
+            votes.append(detected)
 
-        # Crop to square BEFORE drawing anything overlaid, then remap
-        # landmark coordinates into that cropped frame. Drawing on the full
-        # (non-square) frame first — like the old code did — meant the crop
-        # step afterward sliced off whatever fell outside the centered
-        # square, which for a widescreen webcam is most of the left/right
-        # edges, including the fixed (10, 25) corner all the debug text and
-        # the hand skeleton lines were drawn at.
-        orig_h, orig_w = frame.shape[:2]
-        side = min(orig_h, orig_w)
-        crop_x0 = (orig_w - side) // 2
-        crop_y0 = (orig_h - side) // 2
-        square_frame = frame[crop_y0:crop_y0 + side, crop_x0:crop_x0 + side]
+            counts = Counter(votes)
+            top_gesture, top_count = counts.most_common(1)[0]
+            if top_count >= VOTE_MAJORITY:
+                stable_gesture = top_gesture
 
-        if hand_result.hand_landmarks:
-            draw_hand_landmarks(square_frame, hand_result.hand_landmarks, orig_w, orig_h, crop_x0, crop_y0)
+            # Crop to square BEFORE drawing anything overlaid, then remap
+            # landmark coordinates into that cropped frame. Drawing on the full
+            # (non-square) frame first — like the old code did — meant the crop
+            # step afterward sliced off whatever fell outside the centered
+            # square, which for a widescreen webcam is most of the left/right
+            # edges, including the fixed (10, 25) corner all the debug text and
+            # the hand skeleton lines were drawn at.
+            orig_h, orig_w = frame.shape[:2]
+            side = min(orig_h, orig_w)
+            crop_x0 = (orig_w - side) // 2
+            crop_y0 = (orig_h - side) // 2
+            square_frame = frame[crop_y0:crop_y0 + side, crop_x0:crop_x0 + side]
 
-        yaw_text = f"{yaw_deg:.1f}" if yaw_deg is not None else "n/a"
-        cv2.putText(
-            square_frame, f"{detected}  yaw={yaw_text}", (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
-        )
-        if hand_result.hand_landmarks:
-            first_hand = hand_result.hand_landmarks[0]
-            fingers_text = "fingers T,I,M,R,P=" + str(fingers_up(first_hand))
-            cv2.putText(
-                square_frame, fingers_text, (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
-            )
-            pinch_text = f"pinch={is_pinch(first_hand)} ({pinch_dist_ratio(first_hand):.2f})  thumb_dy={thumb_dy_ratio(first_hand):.2f}"
-            if face_result.face_landmarks:
-                face_c = landmarks_center(face_result.face_landmarks[0])
-                hand_to_face = np.linalg.norm(landmarks_center(first_hand) - face_c)
-                pinch_text += f"  face_dist={hand_to_face:.2f}"
-            cv2.putText(
-                square_frame, pinch_text, (10, 75),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
-            )
-            if face_result.face_landmarks:
-                mouth_lm = face_result.face_landmarks[0][MOUTH_LANDMARK]
-                mouth_pt = np.array([mouth_lm.x, mouth_lm.y])
-                fingertip_pt = np.array([first_hand[8].x, first_hand[8].y])
-                mouth_dist = np.linalg.norm(fingertip_pt - mouth_pt)
-                pointer_shape = classify_single_hand(fingers_up(first_hand)) == "pointer"
+            if hand_result.hand_landmarks:
+                draw_hand_landmarks(square_frame, hand_result.hand_landmarks, orig_w, orig_h, crop_x0, crop_y0)
+
+            if debug_on:
+                draw_debug_backdrop(square_frame)
+
+                yaw_text = f"{yaw_deg:.1f}" if yaw_deg is not None else "n/a"
+                pitch_text = f"{pitch_deg:.1f}" if pitch_deg is not None else "n/a"
                 cv2.putText(
-                    square_frame,
-                    f"pointer_shape={pointer_shape}  mouth_dist={mouth_dist:.2f}",
-                    (10, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                    square_frame, f"yaw={yaw_text}  pitch={pitch_text}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
                 )
-        pose_landmarks = pose_result.pose_landmarks[0] if pose_result.pose_landmarks else None
-        if pose_landmarks:
-            signals = bicep_signals(pose_landmarks)
-            if signals is not None:
-                angle, wrist_above, elbow_out = signals
-                bicep_text = f"bicep angle={angle:.0f} wrist_above={wrist_above:.2f} elbow_out={elbow_out:.2f}"
-            else:
-                bicep_text = "bicep: arm not clearly visible"
-            cv2.putText(
-                square_frame,
-                f"cross_arms={detect_cross_arms(pose_landmarks)}  {bicep_text}",
-                (10, 125),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
-            )
+                if hand_result.hand_landmarks:
+                    first_hand = hand_result.hand_landmarks[0]
+                    fingers_text = "fingers T,I,M,R,P=" + str(fingers_up(first_hand))
+                    cv2.putText(
+                        square_frame, fingers_text, (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                    )
+                    pinch_text = f"pinch={is_pinch(first_hand)} ({pinch_dist_ratio(first_hand):.2f})  thumb_dy={thumb_dy_ratio(first_hand):.2f}"
+                    if face_result.face_landmarks:
+                        face_c = landmarks_center(face_result.face_landmarks[0])
+                        hand_to_face = np.linalg.norm(landmarks_center(first_hand) - face_c)
+                        pinch_text += f"  face_dist={hand_to_face:.2f}"
+                    cv2.putText(
+                        square_frame, pinch_text, (10, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                    )
+                    if face_result.face_landmarks:
+                        mouth_lm = face_result.face_landmarks[0][MOUTH_LANDMARK]
+                        mouth_pt = np.array([mouth_lm.x, mouth_lm.y])
+                        fingertip_pt = np.array([first_hand[8].x, first_hand[8].y])
+                        mouth_dist = np.linalg.norm(fingertip_pt - mouth_pt)
+                        pointer_shape = classify_single_hand(fingers_up(first_hand)) == "pointer"
+                        cv2.putText(
+                            square_frame,
+                            f"pointer_shape={pointer_shape}  mouth_dist={mouth_dist:.2f}",
+                            (10, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                        )
+                pose_landmarks = pose_result.pose_landmarks[0] if pose_result.pose_landmarks else None
+                if pose_landmarks:
+                    signals = bicep_signals(pose_landmarks)
+                    if signals is not None:
+                        angle, wrist_above, elbow_out = signals
+                        bicep_text = f"bicep angle={angle:.0f} wrist_above={wrist_above:.2f} elbow_out={elbow_out:.2f}"
+                    else:
+                        bicep_text = "bicep: arm not clearly visible"
+                    cv2.putText(
+                        square_frame,
+                        f"cross_arms={detect_cross_arms(pose_landmarks)}  {bicep_text}",
+                        (10, 125),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                    )
+                if hand_result.hand_landmarks and len(hand_result.hand_landmarks) == 2:
+                    centers = two_hand_centers(hand_result.hand_landmarks)
+                    hands_dist = np.linalg.norm(centers[0] - centers[1])
+                    two_hand_text = f"hands_dist={hands_dist:.2f}"
+                    if face_result.face_landmarks:
+                        face_landmarks = face_result.face_landmarks[0]
+                        head_c = landmarks_center(face_landmarks)
+                        mouth_lm = face_landmarks[MOUTH_LANDMARK]
+                        mouth_pt = np.array([mouth_lm.x, mouth_lm.y])
+                        avg_center = (centers[0] + centers[1]) / 2
+                        two_hand_text += (
+                            f"  mouth_dist={np.linalg.norm(avg_center - mouth_pt):.2f}"
+                            f"  below_face={avg_center[1] - head_c[1]:.2f}"
+                        )
+                    cv2.putText(
+                        square_frame, two_hand_text, (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                    )
 
-        cam_view = cv2.resize(square_frame, (WINDOW_W, WINDOW_H))
-        meme_view = meme_images[stable_gesture]
+            cam_view = cv2.resize(square_frame, (WINDOW_W, WINDOW_H))
+            meme_view = meme_images[stable_gesture]
 
-        combined = np.hstack((meme_view, cam_view))
-        cv2.imshow("Gesture Meme", combined)
+            canvas = compose_window(meme_view, cam_view, stable_gesture, debug_on)
+            cv2.imshow(WINDOW_NAME, canvas)
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-    hand_landmarker.close()
-    face_landmarker.close()
-    pose_landmarker.close()
-    cap.release()
-    cv2.destroyAllWindows()
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):   # 27 = Esc
+                break
+            if key == ord("d"):
+                debug_on = not debug_on
+            # Also quit if the window was closed via its titlebar close button.
+            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        hand_landmarker.close()
+        face_landmarker.close()
+        pose_landmarker.close()
+        cap.release()
+        cv2.destroyAllWindows()
+        print("Bye!")
 
 
 if __name__ == "__main__":
